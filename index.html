@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#f5f3ee">
+  <meta name="description" content="スマホだけで、写真館品質の就活証明写真を作れるプライバシー重視のWebアプリ">
+  <title>Shukatsu Photo — 就活写真を、スマホで。</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="#" aria-label="Shukatsu Photo ホーム">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><path d="M8 7.5h4l1.2-2h5.6l1.2 2h4A3.5 3.5 0 0 1 27.5 11v12A3.5 3.5 0 0 1 24 26.5H8A3.5 3.5 0 0 1 4.5 23V11A3.5 3.5 0 0 1 8 7.5Z"/><circle cx="16" cy="17" r="5.2"/></svg>
+      </span>
+      <span>Shukatsu Photo</span>
+    </a>
+    <div class="header-actions">
+      <span class="privacy-pill">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 1.8 16 4v4.6c0 4.1-2.4 7.6-6 9.6-3.6-2-6-5.5-6-9.6V4l6-2.2Z"/><path d="m7.2 9.8 1.8 1.8 3.9-4"/></svg>
+        写真は端末内で処理
+      </span>
+      <button class="icon-button" id="helpButton" aria-label="撮影のコツを見る">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.8 9a2.3 2.3 0 1 1 3.4 2c-.8.5-1.2 1-1.2 2"/><path d="M12 17h.01"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="eyebrow"><span></span> 写真館クオリティを、0円で</div>
+      <h1>自信が伝わる一枚を、<br><em>スマホだけで。</em></h1>
+      <p class="hero-copy">撮影から背景補正・明るさ調整・ES用サイズへの書き出しまで。<br class="desktop-only">写真はアップロードされず、すべてこの端末の中で完成します。</p>
+
+      <div class="start-actions">
+        <button class="primary-button" id="cameraButton">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7.5h3l1.3-2h7.4l1.3 2h3a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Z"/><circle cx="12" cy="14" r="4"/></svg>
+          カメラで撮影
+        </button>
+        <button class="secondary-button" id="uploadButton">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V3"/><path d="m7 8 5-5 5 5"/><path d="M4 14v5a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5"/></svg>
+          写真を選ぶ
+        </button>
+        <input id="fileInput" type="file" accept="image/*" hidden>
+      </div>
+
+      <div class="quality-row" aria-label="アプリの特徴">
+        <div><span class="check">✓</span> 登録不要</div>
+        <div><span class="check">✓</span> 完全無料</div>
+        <div><span class="check">✓</span> 高画質保存</div>
+      </div>
+    </section>
+
+    <section class="studio-section" id="studioSection" aria-labelledby="studioTitle">
+      <div class="section-heading">
+        <div>
+          <span class="section-number">01</span>
+          <h2 id="studioTitle">写真を整える</h2>
+        </div>
+        <button class="text-button" id="resetButton">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6.5A7 7 0 1 1 3.3 12"/><path d="M4 2.5v4h4"/></svg>
+          リセット
+        </button>
+      </div>
+
+      <div class="editor-shell">
+        <div class="preview-panel">
+          <div class="photo-stage" id="photoStage">
+            <canvas id="previewCanvas" width="900" height="1200" aria-label="証明写真プレビュー"></canvas>
+            <div class="empty-state" id="emptyState">
+              <div class="portrait-placeholder" aria-hidden="true">
+                <span class="head"></span>
+                <span class="body"></span>
+                <span class="guide-line guide-eyes"></span>
+                <span class="guide-line guide-chin"></span>
+              </div>
+              <strong>写真を撮影または選択してください</strong>
+              <span>正面を向き、胸から上が写った写真がおすすめです</span>
+            </div>
+            <div class="crop-guides" id="cropGuides" hidden>
+              <span class="guide-label eyes-label">目線</span>
+              <span class="crop-line eyes-line"></span>
+              <span class="guide-label chin-label">あご</span>
+              <span class="crop-line chin-line"></span>
+              <span class="center-line"></span>
+            </div>
+          </div>
+          <div class="stage-hint" id="stageHint">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7.5 4.5v-1a1.5 1.5 0 0 1 3 0v1"/><path d="M10.5 4V2.8a1.5 1.5 0 0 1 3 0V5"/><path d="M13.5 5V4a1.5 1.5 0 0 1 3 0v6.5c0 4-2.5 6.5-6 6.5H9c-2 0-3.1-.8-4.3-2.3L2.8 12a1.5 1.5 0 0 1 2.3-1.9l1.4 1.4v-7a1.5 1.5 0 0 1 3 0v2"/></svg>
+            ドラッグで位置調整・ピンチで拡大
+          </div>
+        </div>
+
+        <aside class="controls-panel">
+          <div class="control-group">
+            <div class="control-label">
+              <span><b>1</b> 写真サイズ</span>
+              <span class="status-text">3:4</span>
+            </div>
+            <div class="preset-grid">
+              <button class="preset-card active" data-preset="es">
+                <span class="preset-icon ratio-34"></span>
+                <span><strong>Web ES</strong><small>1200 × 1600 px</small></span>
+                <span class="selected-dot"></span>
+              </button>
+              <button class="preset-card" data-preset="resume">
+                <span class="preset-icon ratio-34"></span>
+                <span><strong>履歴書</strong><small>30 × 40 mm</small></span>
+                <span class="selected-dot"></span>
+              </button>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <div class="control-label">
+              <span><b>2</b> 背景</span>
+              <button class="mini-action" id="autoBackgroundButton">自動で整える</button>
+            </div>
+            <div class="background-options" role="radiogroup" aria-label="背景色">
+              <button class="color-swatch active" data-bg="#f8f8f6" style="--swatch:#f8f8f6" aria-label="白" title="白"><span>✓</span></button>
+              <button class="color-swatch" data-bg="#dce9f2" style="--swatch:#dce9f2" aria-label="ライトブルー" title="ライトブルー"><span>✓</span></button>
+              <button class="color-swatch" data-bg="#e3e5e6" style="--swatch:#e3e5e6" aria-label="ライトグレー" title="ライトグレー"><span>✓</span></button>
+              <button class="color-swatch original-swatch" data-bg="original" aria-label="元の背景" title="元の背景"><span>元</span></button>
+            </div>
+            <label class="toggle-row">
+              <span><strong>背景を自動補正</strong><small>四隅から背景を判定して均一にします</small></span>
+              <input id="backgroundToggle" type="checkbox" checked>
+              <span class="toggle"></span>
+            </label>
+          </div>
+
+          <div class="control-group">
+            <div class="control-label">
+              <span><b>3</b> 仕上がり調整</span>
+              <button class="mini-action" id="autoAdjustButton">おすすめ補正</button>
+            </div>
+            <div class="slider-list">
+              <label class="slider-row">
+                <span>明るさ</span>
+                <input id="brightnessSlider" type="range" min="70" max="135" value="104">
+                <output id="brightnessValue">+4</output>
+              </label>
+              <label class="slider-row">
+                <span>コントラスト</span>
+                <input id="contrastSlider" type="range" min="75" max="130" value="102">
+                <output id="contrastValue">+2</output>
+              </label>
+              <label class="slider-row">
+                <span>肌をなめらかに</span>
+                <input id="smoothSlider" type="range" min="0" max="8" value="2">
+                <output id="smoothValue">2</output>
+              </label>
+              <label class="slider-row">
+                <span>色温度</span>
+                <input id="warmthSlider" type="range" min="-10" max="10" value="1">
+                <output id="warmthValue">+1</output>
+              </label>
+            </div>
+            <p class="ethics-note">
+              <svg viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="7"/><path d="M9 8v4"/><path d="M9 5.5h.01"/></svg>
+              顔立ちを変えず、清潔感を引き出す自然な補正です
+            </p>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="export-section" id="exportSection" aria-labelledby="exportTitle">
+      <div class="section-heading">
+        <div>
+          <span class="section-number">02</span>
+          <h2 id="exportTitle">保存する</h2>
+        </div>
+      </div>
+      <div class="export-card">
+        <div class="export-info">
+          <div class="file-icon">
+            <svg viewBox="0 0 30 30" aria-hidden="true"><path d="M7 3h10l6 6v18H7V3Z"/><path d="M17 3v6h6"/><path d="M10 20h10M10 16h10"/></svg>
+          </div>
+          <div>
+            <strong id="exportName">shukatsu-photo.jpg</strong>
+            <span id="exportDetails">JPEG・1200 × 1600 px・高画質</span>
+          </div>
+        </div>
+        <div class="format-control">
+          <button class="format-button active" data-format="jpeg">JPEG</button>
+          <button class="format-button" data-format="png">PNG</button>
+        </div>
+        <button class="download-button" id="downloadButton" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v13"/><path d="m7 11 5 5 5-5"/><path d="M4 20h16"/></svg>
+          写真を保存
+        </button>
+      </div>
+      <p class="export-note">企業の指定サイズがある場合は、提出要項を必ず確認してください。</p>
+    </section>
+
+    <section class="tips-section">
+      <div class="tips-copy">
+        <span class="section-kicker">BEFORE YOU SHOOT</span>
+        <h2>通過率を上げる、<br>撮影前の3つのコツ。</h2>
+        <p>高い機材より、光・姿勢・表情。<br>少し整えるだけで印象は大きく変わります。</p>
+      </div>
+      <div class="tip-cards">
+        <article>
+          <span class="tip-number">01</span>
+          <div class="tip-illustration light-tip" aria-hidden="true">
+            <span class="window"></span><span class="person"></span><span class="light-rays"></span>
+          </div>
+          <h3>窓に向かって立つ</h3>
+          <p>日中の柔らかい自然光が、顔の影をきれいに消してくれます。</p>
+        </article>
+        <article>
+          <span class="tip-number">02</span>
+          <div class="tip-illustration posture-tip" aria-hidden="true">
+            <span class="posture-person"></span><span class="posture-line"></span>
+          </div>
+          <h3>背筋を伸ばす</h3>
+          <p>肩を少し後ろに引き、あごを軽く引くと誠実な印象になります。</p>
+        </article>
+        <article>
+          <span class="tip-number">03</span>
+          <div class="tip-illustration smile-tip" aria-hidden="true">
+            <span class="smile-face"></span><span class="smile-mark">⌒</span>
+          </div>
+          <h3>口角をほんの少し上げる</h3>
+          <p>歯を見せず、面接官と目が合ったときの自然な表情を意識。</p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a class="brand footer-brand" href="#">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><path d="M8 7.5h4l1.2-2h5.6l1.2 2h4A3.5 3.5 0 0 1 27.5 11v12A3.5 3.5 0 0 1 24 26.5H8A3.5 3.5 0 0 1 4.5 23V11A3.5 3.5 0 0 1 8 7.5Z"/><circle cx="16" cy="17" r="5.2"/></svg>
+      </span>
+      <span>Shukatsu Photo</span>
+    </a>
+    <p>あなたらしい一枚が、次の一歩につながりますように。</p>
+    <span>© 2026 Shukatsu Photo</span>
+  </footer>
+
+  <dialog id="cameraDialog">
+    <div class="dialog-header">
+      <div>
+        <span class="dialog-step">撮影モード</span>
+        <h2>枠に顔を合わせてください</h2>
+      </div>
+      <button class="icon-button dialog-close" aria-label="閉じる">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+    <div class="camera-view">
+      <video id="cameraVideo" autoplay playsinline muted></video>
+      <div class="camera-overlay">
+        <span class="face-oval"></span>
+        <span class="shoulder-guide"></span>
+        <span class="eye-guide"></span>
+      </div>
+      <div class="camera-message">カメラは目の高さに · 背筋を伸ばす · あごを軽く引く</div>
+    </div>
+    <div class="camera-actions">
+      <button class="secondary-button" id="switchCameraButton">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 0-14.8-4.2L3 11"/><path d="M3 5v6h6"/><path d="M4 12a8 8 0 0 0 14.8 4.2L21 13"/><path d="M21 19v-6h-6"/></svg>
+        カメラ切替
+      </button>
+      <button class="shutter-button" id="shutterButton" aria-label="撮影する"><span></span></button>
+      <span class="camera-spacer"></span>
+    </div>
+  </dialog>
+
+  <dialog id="helpDialog" class="help-dialog">
+    <button class="icon-button dialog-close help-close" aria-label="閉じる">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+    </button>
+    <span class="dialog-step">きれいに撮るために</span>
+    <h2>撮影前チェック</h2>
+    <ul>
+      <li><span>1</span><div><strong>無地の壁を背にする</strong><small>壁から50cmほど離れると影が薄くなります。</small></div></li>
+      <li><span>2</span><div><strong>カメラを目の高さに固定</strong><small>スマホスタンドがなければ、本を重ねてもOK。</small></div></li>
+      <li><span>3</span><div><strong>レンズを拭く</strong><small>たった一拭きで、写真の透明感が変わります。</small></div></li>
+      <li><span>4</span><div><strong>タイマーで撮る</strong><small>撮影ボタンを押す動きによるブレを防げます。</small></div></li>
+    </ul>
+    <button class="primary-button help-got-it">わかりました</button>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

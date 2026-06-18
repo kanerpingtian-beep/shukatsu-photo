@@ -1,0 +1,10 @@
+{
+  "name": "Shukatsu Photo",
+  "short_name": "就活写真",
+  "description": "スマホだけで写真館品質の就活証明写真を作成",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f5f3ee",
+  "theme_color": "#1f5c48",
+  "icons": []
+}
