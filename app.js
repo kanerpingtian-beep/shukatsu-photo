@@ -88,8 +88,8 @@ function resetAdjustments(render = true) {
   if (render) scheduleRender();
 }
 
-function loadImageFile(file) {
-  if (!file || !file.type.startsWith("image/")) {
+async function loadImageFile(file) {
+  if (!file || (file.type && !file.type.startsWith("image/"))) {
     showToast("画像ファイルを選んでください");
     return;
   }
@@ -98,32 +98,58 @@ function loadImageFile(file) {
     return;
   }
 
-  const reader = new FileReader();
-  reader.onload = () => {
+  showToast("写真を読み込んでいます…");
+  const objectUrl = URL.createObjectURL(file);
+
+  try {
     const image = new Image();
-    image.onload = () => setSourceImage(image);
-    image.onerror = () => showToast("写真を読み込めませんでした");
-    image.src = reader.result;
-  };
-  reader.readAsDataURL(file);
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = reject;
+      image.src = objectUrl;
+    });
+    setSourceImage(image);
+  } catch (error) {
+    showToast("写真を読み込めませんでした。JPEGまたはPNGをお試しください");
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
 }
 
 function setSourceImage(image) {
-  state.image = image;
-  state.scale = 1;
-  state.offsetX = 0;
-  state.offsetY = 0;
-  sourceCanvas.width = image.naturalWidth || image.width;
-  sourceCanvas.height = image.naturalHeight || image.height;
-  sourceCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
-  sourceCtx.drawImage(image, 0, 0);
-  $("#emptyState").hidden = true;
-  $("#cropGuides").hidden = false;
-  $("#stageHint").classList.add("active");
-  $("#downloadButton").disabled = false;
-  scheduleRender();
-  $("#studioSection").scrollIntoView({ behavior: "smooth", block: "start" });
-  showToast("写真を読み込みました。位置を整えてください");
+  try {
+    const originalWidth = image.naturalWidth || image.width;
+    const originalHeight = image.naturalHeight || image.height;
+    const maxEdge = 2560;
+    const maxPixels = 5_000_000;
+    const edgeScale = Math.min(1, maxEdge / Math.max(originalWidth, originalHeight));
+    const pixelScale = Math.min(1, Math.sqrt(maxPixels / (originalWidth * originalHeight)));
+    const sourceScale = Math.min(edgeScale, pixelScale);
+
+    sourceCanvas.width = Math.max(1, Math.round(originalWidth * sourceScale));
+    sourceCanvas.height = Math.max(1, Math.round(originalHeight * sourceScale));
+    sourceCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
+    sourceCtx.imageSmoothingEnabled = true;
+    sourceCtx.imageSmoothingQuality = "high";
+    sourceCtx.drawImage(image, 0, 0, sourceCanvas.width, sourceCanvas.height);
+
+    state.image = image;
+    state.scale = 1;
+    state.offsetX = 0;
+    state.offsetY = 0;
+    const emptyState = $("#emptyState");
+    emptyState.hidden = true;
+    emptyState.classList.add("is-hidden");
+    $("#cropGuides").hidden = false;
+    $("#stageHint").classList.add("active");
+    $("#downloadButton").disabled = false;
+    scheduleRender();
+    $("#studioSection").scrollIntoView({ behavior: "smooth", block: "start" });
+    showToast("写真を読み込みました。位置を整えてください");
+  } catch (error) {
+    state.image = null;
+    showToast("写真の処理に失敗しました。別の写真をお試しください");
+  }
 }
 
 function getCoverTransform(targetWidth, targetHeight) {
