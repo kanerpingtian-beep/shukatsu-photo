@@ -7,6 +7,10 @@ const sourceCanvas = document.createElement("canvas");
 const sourceCtx = sourceCanvas.getContext("2d", { willReadFrequently: true });
 const processedCanvas = document.createElement("canvas");
 const processedCtx = processedCanvas.getContext("2d", { willReadFrequently: true });
+const segmentationInputCanvas = document.createElement("canvas");
+const segmentationInputCtx = segmentationInputCanvas.getContext("2d");
+const personMaskCanvas = document.createElement("canvas");
+const personMaskCtx = personMaskCanvas.getContext("2d");
 
 const state = {
   image: null,
@@ -25,8 +29,16 @@ const state = {
   lastPointer: null,
   stream: null,
   facingMode: "user",
-  renderQueued: false
+  renderQueued: false,
+  maskStatus: "idle",
+  maskRevision: 0
 };
+
+const MEDIAPIPE_VERSION = "0.10.35";
+const MEDIAPIPE_MODULE_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/vision_bundle.mjs`;
+const MEDIAPIPE_WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/wasm`;
+const PERSON_SEGMENTATION_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
+let personSegmenterPromise = null;
 
 const presets = {
   es: { width: 1200, height: 1600, label: "1200 × 1600 px" },
@@ -59,6 +71,208 @@ function updateExportText() {
   const preset = presets[state.preset];
   $("#exportName").textContent = `shukatsu-photo.${state.format === "jpeg" ? "jpg" : "png"}`;
   $("#exportDetails").textContent = `${state.format.toUpperCase()}・${preset.width} × ${preset.height} px・高画質`;
+}
+
+function setBackgroundStatus(status) {
+  state.maskStatus = status;
+  const button = $("#autoBackgroundButton");
+  if (status === "loading") {
+    button.textContent = "AI認識中…";
+    button.disabled = true;
+    $("#downloadButton").disabled = true;
+  } else if (status === "ready") {
+    button.textContent = "AI補正済み";
+    button.disabled = false;
+    $("#downloadButton").disabled = !state.image;
+  } else if (status === "error") {
+    button.textContent = "もう一度試す";
+    button.disabled = false;
+    $("#downloadButton").disabled = !state.image;
+  } else {
+    button.textContent = "AIで背景を整える";
+    button.disabled = false;
+  }
+}
+
+async function getPersonSegmenter() {
+  if (personSegmenterPromise) return personSegmenterPromise;
+
+  personSegmenterPromise = (async () => {
+    const { FilesetResolver, ImageSegmenter } = await import(MEDIAPIPE_MODULE_URL);
+    const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL);
+    return ImageSegmenter.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: PERSON_SEGMENTATION_MODEL_URL
+      },
+      runningMode: "IMAGE",
+      outputCategoryMask: true,
+      outputConfidenceMasks: true
+    });
+  })();
+
+  try {
+    return await personSegmenterPromise;
+  } catch (error) {
+    personSegmenterPromise = null;
+    throw error;
+  }
+}
+
+function smoothStep(min, max, value) {
+  const x = Math.max(0, Math.min(1, (value - min) / (max - min)));
+  return x * x * (3 - 2 * x);
+}
+
+function findMainPersonRegion(confidenceData, width, height, threshold = .42) {
+  const labels = new Int32Array(width * height);
+  labels.fill(-1);
+  const queue = new Int32Array(width * height);
+  let componentId = 0;
+  let bestComponent = -1;
+  let bestScore = 0;
+
+  for (let start = 0; start < confidenceData.length; start++) {
+    if (labels[start] !== -1 || confidenceData[start] < threshold) continue;
+
+    let head = 0;
+    let tail = 0;
+    let size = 0;
+    let centralPixels = 0;
+    queue[tail++] = start;
+    labels[start] = componentId;
+
+    while (head < tail) {
+      const index = queue[head++];
+      const x = index % width;
+      const y = Math.floor(index / width);
+      size++;
+
+      const normalizedX = (x / width - .5) / .36;
+      const normalizedY = (y / height - .48) / .48;
+      if (normalizedX * normalizedX + normalizedY * normalizedY < 1) centralPixels++;
+
+      const neighbors = [
+        x > 0 ? index - 1 : -1,
+        x < width - 1 ? index + 1 : -1,
+        y > 0 ? index - width : -1,
+        y < height - 1 ? index + width : -1
+      ];
+
+      for (const neighbor of neighbors) {
+        if (
+          neighbor >= 0 &&
+          labels[neighbor] === -1 &&
+          confidenceData[neighbor] >= threshold
+        ) {
+          labels[neighbor] = componentId;
+          queue[tail++] = neighbor;
+        }
+      }
+    }
+
+    const score = size + centralPixels * 3;
+    if (score > bestScore) {
+      bestScore = score;
+      bestComponent = componentId;
+    }
+    componentId++;
+  }
+
+  const region = new Uint8Array(width * height);
+  if (bestComponent < 0) return region;
+  for (let index = 0; index < labels.length; index++) {
+    if (labels[index] === bestComponent) region[index] = 1;
+  }
+  return region;
+}
+
+function closeSegmentationResult(result) {
+  result.categoryMask?.close();
+  result.confidenceMasks?.forEach(mask => mask.close());
+}
+
+async function createPersonMask() {
+  if (!state.image || state.maskStatus === "loading") return;
+
+  const revision = ++state.maskRevision;
+  setBackgroundStatus("loading");
+  showToast("AIが人物の輪郭を認識しています…");
+
+  try {
+    const maxInputEdge = 1024;
+    const inputScale = Math.min(1, maxInputEdge / Math.max(sourceCanvas.width, sourceCanvas.height));
+    segmentationInputCanvas.width = Math.max(1, Math.round(sourceCanvas.width * inputScale));
+    segmentationInputCanvas.height = Math.max(1, Math.round(sourceCanvas.height * inputScale));
+    segmentationInputCtx.clearRect(0, 0, segmentationInputCanvas.width, segmentationInputCanvas.height);
+    segmentationInputCtx.imageSmoothingEnabled = true;
+    segmentationInputCtx.imageSmoothingQuality = "high";
+    segmentationInputCtx.drawImage(
+      sourceCanvas,
+      0,
+      0,
+      segmentationInputCanvas.width,
+      segmentationInputCanvas.height
+    );
+
+    const segmenter = await getPersonSegmenter();
+    const result = await new Promise((resolve, reject) => {
+      try {
+        segmenter.segment(segmentationInputCanvas, resolve);
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    if (revision !== state.maskRevision) {
+      closeSegmentationResult(result);
+      return;
+    }
+
+    const confidenceMask = result.confidenceMasks?.length
+      ? result.confidenceMasks[Math.min(1, result.confidenceMasks.length - 1)]
+      : null;
+    const categoryMask = result.categoryMask || null;
+    const mask = confidenceMask || categoryMask;
+    if (!mask) throw new Error("人物マスクを取得できませんでした");
+
+    const width = mask.width;
+    const height = mask.height;
+    const confidenceData = confidenceMask ? new Float32Array(confidenceMask.getAsFloat32Array()) : null;
+    const categoryData = categoryMask ? new Uint8Array(categoryMask.getAsUint8Array()) : null;
+    const imageData = personMaskCtx.createImageData(width, height);
+    const mainPersonRegion = confidenceData
+      ? findMainPersonRegion(confidenceData, width, height)
+      : null;
+
+    for (let index = 0; index < width * height; index++) {
+      const confidence = confidenceData ? confidenceData[index] : (categoryData[index] === 1 ? 1 : 0);
+      const isPerson = mainPersonRegion ? mainPersonRegion[index] === 1 : confidence >= .5;
+      const alpha = isPerson
+        ? Math.round(smoothStep(.42, .68, confidence) * 255)
+        : 0;
+      const pixel = index * 4;
+      imageData.data[pixel] = 255;
+      imageData.data[pixel + 1] = 255;
+      imageData.data[pixel + 2] = 255;
+      imageData.data[pixel + 3] = alpha;
+    }
+
+    personMaskCanvas.width = width;
+    personMaskCanvas.height = height;
+    personMaskCtx.putImageData(imageData, 0, 0);
+    closeSegmentationResult(result);
+
+    setBackgroundStatus("ready");
+    scheduleRender();
+    showToast("人物を残して背景をきれいに分離しました");
+  } catch (error) {
+    if (revision !== state.maskRevision) return;
+    personMaskCanvas.width = 0;
+    personMaskCanvas.height = 0;
+    setBackgroundStatus("error");
+    scheduleRender();
+    showToast("AI背景補正を読み込めませんでした。通信環境を確認して再試行してください");
+  }
 }
 
 function resetAdjustments(render = true) {
@@ -133,10 +347,14 @@ function setSourceImage(image) {
     sourceCtx.imageSmoothingQuality = "high";
     sourceCtx.drawImage(image, 0, 0, sourceCanvas.width, sourceCanvas.height);
 
-    state.image = image;
+    state.image = true;
+    state.maskRevision++;
     state.scale = 1;
     state.offsetX = 0;
     state.offsetY = 0;
+    personMaskCanvas.width = 0;
+    personMaskCanvas.height = 0;
+    setBackgroundStatus("idle");
     const emptyState = $("#emptyState");
     emptyState.hidden = true;
     emptyState.classList.add("is-hidden");
@@ -144,6 +362,7 @@ function setSourceImage(image) {
     $("#stageHint").classList.add("active");
     $("#downloadButton").disabled = false;
     scheduleRender();
+    createPersonMask();
     $("#studioSection").scrollIntoView({ behavior: "smooth", block: "start" });
     showToast("写真を読み込みました。位置を整えてください");
   } catch (error) {
@@ -172,79 +391,6 @@ function getCoverTransform(targetWidth, targetHeight) {
     width: drawWidth,
     height: drawHeight
   };
-}
-
-function colorDistance(r, g, b, sample) {
-  const dr = r - sample.r;
-  const dg = g - sample.g;
-  const db = b - sample.b;
-  return Math.sqrt(dr * dr * .8 + dg * dg * 1.15 + db * db * .7);
-}
-
-function getCornerBackgroundSamples(imageData, width, height) {
-  const data = imageData.data;
-  const samples = [];
-  const areas = [
-    [0, 0, .13, .11],
-    [.87, 0, 1, .11],
-    [0, .89, .1, 1],
-    [.9, .89, 1, 1]
-  ];
-
-  for (const [sx, sy, ex, ey] of areas) {
-    let r = 0, g = 0, b = 0, count = 0;
-    const step = Math.max(1, Math.round(width / 160));
-    for (let y = Math.floor(height * sy); y < Math.floor(height * ey); y += step) {
-      for (let x = Math.floor(width * sx); x < Math.floor(width * ex); x += step) {
-        const i = (y * width + x) * 4;
-        r += data[i]; g += data[i + 1]; b += data[i + 2]; count++;
-      }
-    }
-    samples.push({ r: r / count, g: g / count, b: b / count });
-  }
-  return samples;
-}
-
-function hexToRgb(hex) {
-  const number = parseInt(hex.slice(1), 16);
-  return { r: number >> 16, g: (number >> 8) & 255, b: number & 255 };
-}
-
-function softenBackground(imageData, width, height, backgroundHex) {
-  const data = imageData.data;
-  const samples = getCornerBackgroundSamples(imageData, width, height);
-  const target = hexToRgb(backgroundHex);
-  const centerX = width / 2;
-  const centerY = height * .47;
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = (y * width + x) * 4;
-      const r = data[i], g = data[i + 1], b = data[i + 2];
-      let distance = Infinity;
-      for (const sample of samples) {
-        distance = Math.min(distance, colorDistance(r, g, b, sample));
-      }
-
-      const normalizedX = Math.abs(x - centerX) / centerX;
-      const normalizedY = Math.abs(y - centerY) / height;
-      const personProtection = Math.max(0, 1 - normalizedX * 1.8) * Math.max(0, 1 - normalizedY * 1.4);
-      const edgeBias = Math.min(1, normalizedX * 1.35 + Math.max(0, y / height - .83));
-      const threshold = 25 + edgeBias * 30 - personProtection * 18;
-      let mix = 1 - Math.max(0, Math.min(1, (distance - threshold) / 28));
-      mix *= .94;
-
-      if (y > height * .72 && normalizedX < .52) mix *= .25;
-      if (y > height * .82 && normalizedX < .72) mix *= .45;
-
-      if (mix > .01) {
-        data[i] = r * (1 - mix) + target.r * mix;
-        data[i + 1] = g * (1 - mix) + target.g * mix;
-        data[i + 2] = b * (1 - mix) + target.b * mix;
-      }
-    }
-  }
-  return imageData;
 }
 
 function applyWarmth(imageData, amount) {
@@ -278,15 +424,29 @@ function renderTo(targetCanvas, width, height, highQuality = false) {
   processedCtx.drawImage(sourceCanvas, transform.x, transform.y, transform.width, transform.height);
   processedCtx.filter = "none";
 
-  if (state.removeBackground && state.background !== "original") {
-    let pixels = processedCtx.getImageData(0, 0, width, height);
-    pixels = softenBackground(pixels, width, height, state.background);
-    pixels = applyWarmth(pixels, state.warmth);
-    processedCtx.putImageData(pixels, 0, 0);
-  } else if (state.warmth !== 0) {
+  if (state.warmth !== 0) {
     let pixels = processedCtx.getImageData(0, 0, width, height);
     pixels = applyWarmth(pixels, state.warmth);
     processedCtx.putImageData(pixels, 0, 0);
+  }
+
+  if (
+    state.removeBackground &&
+    state.background !== "original" &&
+    state.maskStatus === "ready" &&
+    personMaskCanvas.width
+  ) {
+    processedCtx.save();
+    processedCtx.globalCompositeOperation = "destination-in";
+    processedCtx.filter = `blur(${Math.max(.8, width / 1200)}px)`;
+    processedCtx.drawImage(
+      personMaskCanvas,
+      transform.x,
+      transform.y,
+      transform.width,
+      transform.height
+    );
+    processedCtx.restore();
   }
 
   targetCtx.drawImage(processedCanvas, 0, 0);
@@ -334,11 +494,13 @@ $$(".color-swatch").forEach(button => button.addEventListener("click", () => {
   $$(".color-swatch").forEach(item => item.classList.toggle("active", item === button));
   $("#backgroundToggle").checked = state.background !== "original";
   state.removeBackground = state.background !== "original";
+  if (state.removeBackground && state.image && state.maskStatus !== "ready") createPersonMask();
   scheduleRender();
 }));
 
 $("#backgroundToggle").addEventListener("change", event => {
   state.removeBackground = event.target.checked;
+  if (state.removeBackground && state.image && state.maskStatus !== "ready") createPersonMask();
   scheduleRender();
 });
 
@@ -382,8 +544,12 @@ $("#autoBackgroundButton").addEventListener("click", () => {
   state.removeBackground = true;
   $("#backgroundToggle").checked = true;
   $$(".color-swatch").forEach((button, index) => button.classList.toggle("active", index === 0));
-  scheduleRender();
-  showToast("背景を白く均一に整えました");
+  if (state.maskStatus === "ready") {
+    scheduleRender();
+    showToast("AI人物分離で背景を白く整えました");
+  } else {
+    createPersonMask();
+  }
 });
 
 $("#resetButton").addEventListener("click", () => {

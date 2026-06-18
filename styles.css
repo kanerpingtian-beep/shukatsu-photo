@@ -252,6 +252,7 @@ h1 em { color: var(--green); font-style: normal; }
 .text-button:hover, .mini-action:hover { color: var(--green); }
 .text-button svg { width: 16px; }
 .mini-action { color: var(--green); font-weight: 600; }
+.mini-action:disabled { opacity: .65; cursor: wait; }
 
 .editor-shell {
   display: grid;
