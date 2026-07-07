@@ -7,6 +7,8 @@ const sourceCanvas = document.createElement("canvas");
 const sourceCtx = sourceCanvas.getContext("2d", { willReadFrequently: true });
 const processedCanvas = document.createElement("canvas");
 const processedCtx = processedCanvas.getContext("2d", { willReadFrequently: true });
+const smoothCanvas = document.createElement("canvas");
+const smoothCtx = smoothCanvas.getContext("2d");
 const segmentationInputCanvas = document.createElement("canvas");
 const segmentationInputCtx = segmentationInputCanvas.getContext("2d");
 const personMaskCanvas = document.createElement("canvas");
@@ -31,8 +33,15 @@ const state = {
   facingMode: "user",
   renderQueued: false,
   maskStatus: "idle",
-  maskRevision: 0
+  maskRevision: 0,
+  showOriginal: false,
+  timerSeconds: 0,
+  countdownHandle: null,
+  sizeRevision: 0
 };
+
+const MIN_SCALE = 0.6;
+const MAX_SCALE = 2.5;
 
 const MEDIAPIPE_VERSION = "0.10.35";
 const MEDIAPIPE_MODULE_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/vision_bundle.mjs`;
@@ -40,9 +49,16 @@ const MEDIAPIPE_WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision
 const PERSON_SEGMENTATION_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
 let personSegmenterPromise = null;
 
+// 履歴書: 900×1200px / 762dpi を埋め込むと物理サイズがちょうど 30×40mm になる
+// L判シート: 89×127mm @300dpi (横) = 1500×1051px、30×40mm(354×472px) を8枚面付け
 const presets = {
-  es: { width: 1200, height: 1600, label: "1200 × 1600 px" },
-  resume: { width: 900, height: 1200, label: "30 × 40 mm / 300dpi" }
+  es: { width: 1200, height: 1600, dpi: null, type: "single", describe: () => "1200 × 1600 px・Web ES用" },
+  resume: { width: 900, height: 1200, dpi: 762, type: "single", describe: () => "900 × 1200 px・印刷時 30 × 40 mm" },
+  sheet: {
+    width: 1500, height: 1051, dpi: 300, type: "sheet",
+    tile: { width: 354, height: 472, cols: 4, rows: 2, gap: 8 },
+    describe: () => "L判 1500 × 1051 px・30×40mm を8枚面付け"
+  }
 };
 
 function showToast(message) {
@@ -67,17 +83,18 @@ function signed(value, baseline = 0) {
   return delta > 0 ? `+${delta}` : `${delta}`;
 }
 
-function updateExportText() {
+function updateExportText(sizeText = "") {
   const preset = presets[state.preset];
-  $("#exportName").textContent = `shukatsu-photo.${state.format === "jpeg" ? "jpg" : "png"}`;
-  $("#exportDetails").textContent = `${state.format.toUpperCase()}・${preset.width} × ${preset.height} px・高画質`;
+  const suffix = state.preset === "sheet" ? "-print" : "";
+  $("#exportName").textContent = `shukatsu-photo${suffix}.${state.format === "jpeg" ? "jpg" : "png"}`;
+  $("#exportDetails").textContent = `${state.format.toUpperCase()}・${preset.describe()}${sizeText ? `・${sizeText}` : ""}`;
 }
 
 function setBackgroundStatus(status) {
   state.maskStatus = status;
   const button = $("#autoBackgroundButton");
   if (status === "loading") {
-    button.textContent = "AI認識中…";
+    button.textContent = personSegmenterPromise ? "AI認識中…" : "AIモデル読込中…（初回のみ）";
     button.disabled = true;
     $("#downloadButton").disabled = true;
   } else if (status === "ready") {
@@ -123,7 +140,7 @@ function smoothStep(min, max, value) {
   return x * x * (3 - 2 * x);
 }
 
-function findMainPersonRegion(confidenceData, width, height, threshold = .42) {
+function findMainPersonRegion(confidenceData, width, height, threshold = .34) {
   const labels = new Int32Array(width * height);
   labels.fill(-1);
   const queue = new Int32Array(width * height);
@@ -186,6 +203,69 @@ function findMainPersonRegion(confidenceData, width, height, threshold = .42) {
   return region;
 }
 
+// 分離マスクの収縮（erode）。半透明の境界帯には元背景の色が混ざっており、
+// そのまま白背景に合成すると輪郭に色付きのフリンジが出る。
+// マスクを内側に数px縮めることで、混色した境界ピクセルを捨てる。
+function erodeAlpha(alpha, width, height, radius) {
+  const tmp = new Uint8ClampedArray(alpha.length);
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      let min = 255;
+      const from = Math.max(0, x - radius);
+      const to = Math.min(width - 1, x + radius);
+      for (let xx = from; xx <= to; xx++) {
+        const v = alpha[row + xx];
+        if (v < min) min = v;
+      }
+      tmp[row + x] = min;
+    }
+  }
+  const out = new Uint8ClampedArray(alpha.length);
+  for (let x = 0; x < width; x++) {
+    for (let y = 0; y < height; y++) {
+      let min = 255;
+      const from = Math.max(0, y - radius);
+      const to = Math.min(height - 1, y + radius);
+      for (let yy = from; yy <= to; yy++) {
+        const v = tmp[yy * width + x];
+        if (v < min) min = v;
+      }
+      out[y * width + x] = min;
+    }
+  }
+  return out;
+}
+
+// 収縮後の硬い輪郭をなだらかに戻すフェザリング（分離ボックスブラー）
+function featherAlpha(alpha, width, height, radius) {
+  const window = radius * 2 + 1;
+  const tmp = new Float32Array(alpha.length);
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    let sum = 0;
+    for (let x = -radius; x <= radius; x++) sum += alpha[row + Math.min(width - 1, Math.max(0, x))];
+    for (let x = 0; x < width; x++) {
+      tmp[row + x] = sum / window;
+      const addX = Math.min(width - 1, x + radius + 1);
+      const subX = Math.max(0, x - radius);
+      sum += alpha[row + addX] - alpha[row + subX];
+    }
+  }
+  const out = new Uint8ClampedArray(alpha.length);
+  for (let x = 0; x < width; x++) {
+    let sum = 0;
+    for (let y = -radius; y <= radius; y++) sum += tmp[Math.min(height - 1, Math.max(0, y)) * width + x];
+    for (let y = 0; y < height; y++) {
+      out[y * width + x] = Math.round(sum / window);
+      const addY = Math.min(height - 1, y + radius + 1);
+      const subY = Math.max(0, y - radius);
+      sum += tmp[addY * width + x] - tmp[subY * width + x];
+    }
+  }
+  return out;
+}
+
 function closeSegmentationResult(result) {
   result.categoryMask?.close();
   result.confidenceMasks?.forEach(mask => mask.close());
@@ -239,22 +319,33 @@ async function createPersonMask() {
     const height = mask.height;
     const confidenceData = confidenceMask ? new Float32Array(confidenceMask.getAsFloat32Array()) : null;
     const categoryData = categoryMask ? new Uint8Array(categoryMask.getAsUint8Array()) : null;
-    const imageData = personMaskCtx.createImageData(width, height);
     const mainPersonRegion = confidenceData
       ? findMainPersonRegion(confidenceData, width, height)
       : null;
 
+    // 1. 生のアルファマップを作る（しきい値を下げて髪の毛先まで拾う）
+    let alpha = new Uint8ClampedArray(width * height);
     for (let index = 0; index < width * height; index++) {
-      const confidence = confidenceData ? confidenceData[index] : (categoryData[index] === 1 ? 1 : 0);
-      const isPerson = mainPersonRegion ? mainPersonRegion[index] === 1 : confidence >= .5;
-      const alpha = isPerson
-        ? Math.round(smoothStep(.42, .68, confidence) * 255)
-        : 0;
+      if (confidenceData) {
+        const isPerson = mainPersonRegion ? mainPersonRegion[index] === 1 : confidenceData[index] >= .5;
+        alpha[index] = isPerson ? Math.round(smoothStep(.34, .62, confidenceData[index]) * 255) : 0;
+      } else {
+        alpha[index] = categoryData[index] === 1 ? 255 : 0;
+      }
+    }
+
+    // 2. 収縮 → 3. フェザリング（フリンジ除去の要）
+    const edgeRadius = Math.max(1, Math.round(Math.max(width, height) / 512));
+    alpha = erodeAlpha(alpha, width, height, edgeRadius);
+    alpha = featherAlpha(alpha, width, height, edgeRadius);
+
+    const imageData = personMaskCtx.createImageData(width, height);
+    for (let index = 0; index < width * height; index++) {
       const pixel = index * 4;
       imageData.data[pixel] = 255;
       imageData.data[pixel + 1] = 255;
       imageData.data[pixel + 2] = 255;
-      imageData.data[pixel + 3] = alpha;
+      imageData.data[pixel + 3] = alpha[index];
     }
 
     personMaskCanvas.width = width;
@@ -360,6 +451,7 @@ function setSourceImage(image) {
     emptyState.classList.add("is-hidden");
     $("#cropGuides").hidden = false;
     $("#stageHint").classList.add("active");
+    $("#compareButton").hidden = false;
     $("#downloadButton").disabled = false;
     scheduleRender();
     createPersonMask();
@@ -414,13 +506,20 @@ function renderTo(targetCanvas, width, height, highQuality = false) {
   if (!state.image) return;
   const transform = getCoverTransform(width, height);
 
+  // 長押し比較: 補正なしの元写真をそのまま表示
+  if (state.showOriginal) {
+    targetCtx.imageSmoothingEnabled = true;
+    targetCtx.imageSmoothingQuality = "high";
+    targetCtx.drawImage(sourceCanvas, transform.x, transform.y, transform.width, transform.height);
+    return;
+  }
+
   processedCanvas.width = width;
   processedCanvas.height = height;
   processedCtx.clearRect(0, 0, width, height);
   processedCtx.imageSmoothingEnabled = true;
   processedCtx.imageSmoothingQuality = "high";
-  const smoothAmount = highQuality ? state.smooth * .32 : state.smooth * .22;
-  processedCtx.filter = `brightness(${state.brightness}%) contrast(${state.contrast}%) blur(${smoothAmount}px)`;
+  processedCtx.filter = `brightness(${state.brightness}%) contrast(${state.contrast}%)`;
   processedCtx.drawImage(sourceCanvas, transform.x, transform.y, transform.width, transform.height);
   processedCtx.filter = "none";
 
@@ -430,15 +529,36 @@ function renderTo(targetCanvas, width, height, highQuality = false) {
     processedCtx.putImageData(pixels, 0, 0);
   }
 
+  const maskAvailable = state.maskStatus === "ready" && personMaskCanvas.width > 0;
+
+  // 肌スムージング: 画像全体ではなく人物領域だけにぼかしレイヤーを重ねる。
+  // 背景や輪郭のシャープさを保ったまま、肌のノイズだけをなだらかにする。
+  if (state.smooth > 0) {
+    const radius = state.smooth * .4 * (width / 450);
+    smoothCanvas.width = width;
+    smoothCanvas.height = height;
+    smoothCtx.clearRect(0, 0, width, height);
+    smoothCtx.filter = `blur(${radius}px)`;
+    smoothCtx.drawImage(processedCanvas, 0, 0);
+    smoothCtx.filter = "none";
+    if (maskAvailable) {
+      smoothCtx.globalCompositeOperation = "destination-in";
+      smoothCtx.drawImage(personMaskCanvas, transform.x, transform.y, transform.width, transform.height);
+      smoothCtx.globalCompositeOperation = "source-over";
+    }
+    processedCtx.globalAlpha = .7;
+    processedCtx.drawImage(smoothCanvas, 0, 0);
+    processedCtx.globalAlpha = 1;
+  }
+
   if (
     state.removeBackground &&
     state.background !== "original" &&
-    state.maskStatus === "ready" &&
-    personMaskCanvas.width
+    maskAvailable
   ) {
     processedCtx.save();
     processedCtx.globalCompositeOperation = "destination-in";
-    processedCtx.filter = `blur(${Math.max(.8, width / 1200)}px)`;
+    processedCtx.filter = `blur(${Math.max(.4, width / 2400)}px)`;
     processedCtx.drawImage(
       personMaskCanvas,
       transform.x,
@@ -463,6 +583,92 @@ function scheduleRender() {
   if (state.renderQueued) return;
   state.renderQueued = true;
   requestAnimationFrame(renderPreview);
+  scheduleFileSizeUpdate();
+}
+
+// ---- 書き出し ----
+
+function renderExportCanvas() {
+  const preset = presets[state.preset];
+  const exportCanvas = document.createElement("canvas");
+
+  if (preset.type === "sheet") {
+    const photo = document.createElement("canvas");
+    renderTo(photo, 900, 1200, true);
+    const { tile } = preset;
+    exportCanvas.width = preset.width;
+    exportCanvas.height = preset.height;
+    const sheetCtx = exportCanvas.getContext("2d");
+    sheetCtx.fillStyle = "#ffffff";
+    sheetCtx.fillRect(0, 0, preset.width, preset.height);
+    sheetCtx.imageSmoothingEnabled = true;
+    sheetCtx.imageSmoothingQuality = "high";
+    const gridWidth = tile.cols * tile.width + (tile.cols - 1) * tile.gap;
+    const gridHeight = tile.rows * tile.height + (tile.rows - 1) * tile.gap;
+    const originX = Math.round((preset.width - gridWidth) / 2);
+    const originY = Math.round((preset.height - gridHeight) / 2);
+    sheetCtx.strokeStyle = "#c8c8c8";
+    sheetCtx.lineWidth = 1;
+    for (let row = 0; row < tile.rows; row++) {
+      for (let col = 0; col < tile.cols; col++) {
+        const x = originX + col * (tile.width + tile.gap);
+        const y = originY + row * (tile.height + tile.gap);
+        sheetCtx.drawImage(photo, x, y, tile.width, tile.height);
+        sheetCtx.strokeRect(x + .5, y + .5, tile.width - 1, tile.height - 1);
+      }
+    }
+  } else {
+    renderTo(exportCanvas, preset.width, preset.height, true);
+  }
+  return exportCanvas;
+}
+
+function createExportBlob() {
+  return new Promise(resolve => {
+    const exportCanvas = renderExportCanvas();
+    const mime = state.format === "png" ? "image/png" : "image/jpeg";
+    exportCanvas.toBlob(blob => resolve(blob), mime, .96);
+  });
+}
+
+// JPEG(JFIF)のAPP0に印刷解像度(dpi)を書き込む。
+// これで履歴書プリセットは印刷ソフトでちょうど 30×40mm として扱われる。
+function setJpegDensity(buffer, dpi) {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length > 18 &&
+    bytes[0] === 0xFF && bytes[1] === 0xD8 &&
+    bytes[2] === 0xFF && bytes[3] === 0xE0 &&
+    bytes[6] === 0x4A && bytes[7] === 0x46 && bytes[8] === 0x49 && bytes[9] === 0x46 && bytes[10] === 0x00
+  ) {
+    bytes[13] = 1; // units = dots per inch
+    bytes[14] = (dpi >> 8) & 0xFF;
+    bytes[15] = dpi & 0xFF;
+    bytes[16] = (dpi >> 8) & 0xFF;
+    bytes[17] = dpi & 0xFF;
+  }
+  return bytes;
+}
+
+function formatBytes(bytes) {
+  if (bytes >= 1024 * 1024) return `約${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  return `約${Math.max(1, Math.round(bytes / 1024))}KB`;
+}
+
+// スライダー操作のたびに全画素を書き出すのは重いので、操作が落ち着いてから計測する
+let fileSizeTimer = null;
+function scheduleFileSizeUpdate() {
+  clearTimeout(fileSizeTimer);
+  if (!state.image) {
+    updateExportText();
+    return;
+  }
+  fileSizeTimer = setTimeout(async () => {
+    if (!state.image || state.showOriginal) return;
+    const revision = ++state.sizeRevision;
+    const blob = await createExportBlob();
+    if (!blob || revision !== state.sizeRevision) return;
+    updateExportText(formatBytes(blob.size));
+  }, 900);
 }
 
 $("#uploadButton").addEventListener("click", () => $("#fileInput").click());
@@ -561,25 +767,62 @@ $$(".format-button").forEach(button => button.addEventListener("click", () => {
   state.format = button.dataset.format;
   $$(".format-button").forEach(item => item.classList.toggle("active", item === button));
   updateExportText();
+  scheduleFileSizeUpdate();
 }));
 
-$("#downloadButton").addEventListener("click", () => {
+$("#downloadButton").addEventListener("click", async () => {
   if (!state.image) return;
   const preset = presets[state.preset];
-  const exportCanvas = document.createElement("canvas");
-  renderTo(exportCanvas, preset.width, preset.height, true);
-  const mime = state.format === "png" ? "image/png" : "image/jpeg";
+  const blob = await createExportBlob();
+  if (!blob) {
+    showToast("書き出しに失敗しました。もう一度お試しください");
+    return;
+  }
+
+  let outBlob = blob;
+  if (preset.dpi && state.format === "jpeg") {
+    const bytes = setJpegDensity(await blob.arrayBuffer(), preset.dpi);
+    outBlob = new Blob([bytes], { type: "image/jpeg" });
+  } else if (preset.dpi && state.format === "png") {
+    showToast("印刷サイズ情報の埋め込みはJPEG保存で有効になります");
+  }
+
   const extension = state.format === "png" ? "png" : "jpg";
-  exportCanvas.toBlob(blob => {
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `shukatsu-photo.${extension}`;
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    showToast("高画質の証明写真を保存しました");
-  }, mime, .96);
+  const suffix = state.preset === "sheet" ? "-print" : "";
+  const url = URL.createObjectURL(outBlob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `shukatsu-photo${suffix}.${extension}`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  showToast(
+    state.preset === "sheet"
+      ? "L判印刷用シートを保存しました。コンビニのL判写真プリントで印刷できます"
+      : `高画質の証明写真を保存しました（${formatBytes(outBlob.size)}）`
+  );
 });
+
+// ---- 長押しで元写真と比較 ----
+const compareButton = $("#compareButton");
+function setShowOriginal(value) {
+  if (state.showOriginal === value) return;
+  state.showOriginal = value;
+  compareButton.classList.toggle("holding", value);
+  state.renderQueued = false;
+  requestAnimationFrame(renderPreview);
+}
+compareButton.addEventListener("pointerdown", event => {
+  event.preventDefault();
+  compareButton.setPointerCapture(event.pointerId);
+  setShowOriginal(true);
+});
+["pointerup", "pointercancel", "pointerleave"].forEach(type =>
+  compareButton.addEventListener(type, () => setShowOriginal(false))
+);
+compareButton.addEventListener("keydown", event => {
+  if (event.key === " " || event.key === "Enter") setShowOriginal(true);
+});
+compareButton.addEventListener("keyup", () => setShowOriginal(false));
 
 let pointerStart = null;
 $("#photoStage").addEventListener("pointerdown", event => {
@@ -607,7 +850,7 @@ $("#photoStage").addEventListener("pointercancel", endDrag);
 $("#photoStage").addEventListener("wheel", event => {
   if (!state.image) return;
   event.preventDefault();
-  state.scale = Math.max(1, Math.min(2.5, state.scale - event.deltaY * .001));
+  state.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, state.scale - event.deltaY * .001));
   scheduleRender();
 }, { passive: false });
 
@@ -622,7 +865,7 @@ $("#photoStage").addEventListener("pointermove", event => {
   if (activePointers.size === 2) {
     const [a, b] = [...activePointers.values()];
     const distance = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
-    if (pinchDistance) state.scale = Math.max(1, Math.min(2.5, state.scale * (distance / pinchDistance)));
+    if (pinchDistance) state.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, state.scale * (distance / pinchDistance)));
     pinchDistance = distance;
     scheduleRender();
   }
@@ -633,6 +876,8 @@ const clearPointer = event => {
 };
 $("#photoStage").addEventListener("pointerup", clearPointer);
 $("#photoStage").addEventListener("pointercancel", clearPointer);
+
+// ---- カメラ・セルフタイマー ----
 
 async function openCamera() {
   const dialog = $("#cameraDialog");
@@ -661,6 +906,7 @@ async function openCamera() {
 }
 
 function stopCamera() {
+  cancelCountdown();
   if (state.stream) {
     state.stream.getTracks().forEach(track => track.stop());
     state.stream = null;
@@ -668,13 +914,18 @@ function stopCamera() {
   $("#cameraVideo").srcObject = null;
 }
 
-$("#cameraButton").addEventListener("click", openCamera);
-$("#switchCameraButton").addEventListener("click", async () => {
-  state.facingMode = state.facingMode === "user" ? "environment" : "user";
-  await openCamera();
-});
+function cancelCountdown() {
+  if (state.countdownHandle) {
+    clearInterval(state.countdownHandle);
+    state.countdownHandle = null;
+  }
+  const countdown = $("#timerCountdown");
+  countdown.hidden = true;
+  countdown.textContent = "";
+  $("#shutterButton").classList.remove("counting");
+}
 
-$("#shutterButton").addEventListener("click", () => {
+function capturePhoto() {
   const video = $("#cameraVideo");
   if (!video.videoWidth) return;
   const capture = document.createElement("canvas");
@@ -691,6 +942,44 @@ $("#shutterButton").addEventListener("click", () => {
   image.src = capture.toDataURL("image/jpeg", .96);
   $("#cameraDialog").close();
   stopCamera();
+}
+
+$("#cameraButton").addEventListener("click", openCamera);
+$("#switchCameraButton").addEventListener("click", async () => {
+  state.facingMode = state.facingMode === "user" ? "environment" : "user";
+  await openCamera();
+});
+
+$$(".timer-chip").forEach(button => button.addEventListener("click", () => {
+  state.timerSeconds = Number(button.dataset.timer);
+  $$(".timer-chip").forEach(item => item.classList.toggle("active", item === button));
+}));
+
+$("#shutterButton").addEventListener("click", () => {
+  // カウントダウン中にもう一度押したらキャンセル
+  if (state.countdownHandle) {
+    cancelCountdown();
+    return;
+  }
+  if (state.timerSeconds === 0) {
+    capturePhoto();
+    return;
+  }
+
+  let remaining = state.timerSeconds;
+  const countdown = $("#timerCountdown");
+  countdown.hidden = false;
+  countdown.textContent = remaining;
+  $("#shutterButton").classList.add("counting");
+  state.countdownHandle = setInterval(() => {
+    remaining--;
+    if (remaining <= 0) {
+      cancelCountdown();
+      capturePhoto();
+    } else {
+      countdown.textContent = remaining;
+    }
+  }, 1000);
 });
 
 $(".dialog-close", $("#cameraDialog")).addEventListener("click", () => $("#cameraDialog").close());
