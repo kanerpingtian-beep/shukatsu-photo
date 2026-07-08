@@ -1,5 +1,5 @@
-const CACHE_NAME = "shukatsu-photo-v6";
-const ASSETS = ["./", "./index.html", "./styles.css?v=6", "./app.js?v=6", "./manifest.webmanifest"];
+const CACHE_NAME = "shukatsu-photo-v7";
+const ASSETS = ["./", "./index.html", "./styles.css?v=7", "./app.js?v=7", "./manifest.webmanifest"];
 
 // AIモデル・WASMは内容が変わらないので、一度取得したらキャッシュ優先で返す。
 // これで2回目以降はオフラインでもAI背景分離が動く。

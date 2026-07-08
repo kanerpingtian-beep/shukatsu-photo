@@ -43,7 +43,8 @@ const state = {
   guidanceHandle: null,
   lastAdviceKey: "",
   lastAdviceAt: 0,
-  guidanceErrorShown: false
+  guidanceErrorShown: false,
+  voiceUnlocked: false
 };
 
 const MIN_SCALE = 0.6;
@@ -351,6 +352,40 @@ function setCameraMessage(message, status = "") {
   else delete messageBox.dataset.status;
 }
 
+function getJapaneseVoice() {
+  if (!("speechSynthesis" in window)) return null;
+  const voices = window.speechSynthesis.getVoices?.() || [];
+  return voices.find(voice => voice.lang === "ja-JP") ||
+    voices.find(voice => voice.lang?.startsWith("ja")) ||
+    null;
+}
+
+function createJapaneseUtterance(message) {
+  const utterance = new SpeechSynthesisUtterance(message);
+  utterance.lang = "ja-JP";
+  utterance.voice = getJapaneseVoice();
+  utterance.rate = .98;
+  utterance.pitch = 1;
+  utterance.volume = 1;
+  return utterance;
+}
+
+function unlockVoiceGuidance(message = "音声アドバイスを開始します") {
+  if (!state.voiceGuidance || !("speechSynthesis" in window)) return false;
+  const synth = window.speechSynthesis;
+  synth.cancel();
+  synth.resume?.();
+  const utterance = createJapaneseUtterance(message);
+  utterance.onstart = () => { state.voiceUnlocked = true; };
+  utterance.onend = () => { state.voiceUnlocked = true; };
+  utterance.onerror = () => { state.voiceUnlocked = false; };
+  synth.speak(utterance);
+  state.voiceUnlocked = true;
+  state.lastAdviceKey = "voice-unlock";
+  state.lastAdviceAt = Date.now();
+  return true;
+}
+
 function speakCameraAdvice(message, key, force = false) {
   if (!state.voiceGuidance || !("speechSynthesis" in window)) return;
 
@@ -358,13 +393,11 @@ function speakCameraAdvice(message, key, force = false) {
   if (!force && now - state.lastAdviceAt < 4200) return;
   if (!force && key === state.lastAdviceKey && now - state.lastAdviceAt < 11000) return;
 
-  const utterance = new SpeechSynthesisUtterance(message);
-  utterance.lang = "ja-JP";
-  utterance.rate = 1.02;
-  utterance.pitch = 1;
-  utterance.volume = .9;
-  window.speechSynthesis.cancel();
-  window.speechSynthesis.speak(utterance);
+  const synth = window.speechSynthesis;
+  const utterance = createJapaneseUtterance(message);
+  synth.cancel();
+  synth.resume?.();
+  synth.speak(utterance);
   state.lastAdviceKey = key;
   state.lastAdviceAt = now;
 }
@@ -558,8 +591,10 @@ function startCameraGuidance() {
   state.lastAdviceAt = 0;
   state.voiceGuidance = $("#voiceGuidanceToggle")?.checked ?? state.voiceGuidance;
   setCameraMessage("AIアドバイスを準備中です…", "loading");
-  if (state.voiceGuidance && "speechSynthesis" in window) {
+  if (state.voiceGuidance && state.voiceUnlocked && "speechSynthesis" in window) {
     speakCameraAdvice("音声アドバイスを始めます", "guidance-start", true);
+  } else if (state.voiceGuidance) {
+    setCameraMessage("音声が聞こえない場合は「音声テスト」を押してください", "warn");
   }
   runCameraGuidance();
 }
@@ -1182,6 +1217,10 @@ async function openCamera() {
 
   try {
     stopCamera();
+    state.voiceGuidance = $("#voiceGuidanceToggle")?.checked ?? state.voiceGuidance;
+    if (state.voiceGuidance && !state.voiceUnlocked) {
+      unlockVoiceGuidance("音声アドバイスを準備します");
+    }
     state.stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: state.facingMode,
@@ -1256,11 +1295,23 @@ $("#voiceGuidanceToggle").addEventListener("change", event => {
   state.voiceGuidance = event.target.checked;
   if (state.voiceGuidance) {
     showToast("音声アドバイスをオンにしました");
-    speakCameraAdvice("音声アドバイスをオンにしました", "voice-on", true);
+    unlockVoiceGuidance("音声アドバイスをオンにしました");
   } else {
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    state.voiceUnlocked = false;
     showToast("音声アドバイスをオフにしました");
   }
+});
+
+$("#voiceTestButton").addEventListener("click", () => {
+  if (!("speechSynthesis" in window)) {
+    showToast("このブラウザでは音声読み上げを利用できません");
+    return;
+  }
+  state.voiceGuidance = true;
+  $("#voiceGuidanceToggle").checked = true;
+  const ok = unlockVoiceGuidance("音声テストです。聞こえていれば、そのまま撮影できます");
+  showToast(ok ? "音声テストを再生しました" : "音声アドバイスをオンにしてください");
 });
 
 $("#shutterButton").addEventListener("click", () => {
@@ -1312,6 +1363,9 @@ if (!("speechSynthesis" in window)) {
   voiceGuidanceToggle.checked = false;
   voiceGuidanceToggle.disabled = true;
   voiceGuidanceToggle.closest(".voice-toggle")?.classList.add("disabled");
+  $("#voiceTestButton").disabled = true;
+} else {
+  window.speechSynthesis.onvoiceschanged = () => getJapaneseVoice();
 }
 
 if ("serviceWorker" in navigator && location.protocol !== "file:") {
