@@ -37,7 +37,13 @@ const state = {
   showOriginal: false,
   timerSeconds: 0,
   countdownHandle: null,
-  sizeRevision: 0
+  sizeRevision: 0,
+  voiceGuidance: true,
+  guidanceActive: false,
+  guidanceHandle: null,
+  lastAdviceKey: "",
+  lastAdviceAt: 0,
+  guidanceErrorShown: false
 };
 
 const MIN_SCALE = 0.6;
@@ -47,7 +53,12 @@ const MEDIAPIPE_VERSION = "0.10.35";
 const MEDIAPIPE_MODULE_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/vision_bundle.mjs`;
 const MEDIAPIPE_WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/wasm`;
 const PERSON_SEGMENTATION_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
+const FACE_LANDMARKER_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task";
+const POSE_LANDMARKER_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task";
+let visionBundlePromise = null;
 let personSegmenterPromise = null;
+let faceLandmarkerPromise = null;
+let poseLandmarkerPromise = null;
 
 // 履歴書: 900×1200px / 762dpi を埋め込むと物理サイズがちょうど 30×40mm になる
 // L判シート: 89×127mm @300dpi (横) = 1500×1051px、30×40mm(354×472px) を8枚面付け
@@ -111,12 +122,28 @@ function setBackgroundStatus(status) {
   }
 }
 
+async function getVisionBundle() {
+  if (!visionBundlePromise) {
+    visionBundlePromise = (async () => {
+      const module = await import(MEDIAPIPE_MODULE_URL);
+      const vision = await module.FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL);
+      return { ...module, vision };
+    })();
+  }
+
+  try {
+    return await visionBundlePromise;
+  } catch (error) {
+    visionBundlePromise = null;
+    throw error;
+  }
+}
+
 async function getPersonSegmenter() {
   if (personSegmenterPromise) return personSegmenterPromise;
 
   personSegmenterPromise = (async () => {
-    const { FilesetResolver, ImageSegmenter } = await import(MEDIAPIPE_MODULE_URL);
-    const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL);
+    const { ImageSegmenter, vision } = await getVisionBundle();
     return ImageSegmenter.createFromOptions(vision, {
       baseOptions: {
         modelAssetPath: PERSON_SEGMENTATION_MODEL_URL
@@ -131,6 +158,51 @@ async function getPersonSegmenter() {
     return await personSegmenterPromise;
   } catch (error) {
     personSegmenterPromise = null;
+    throw error;
+  }
+}
+
+async function getFaceLandmarker() {
+  if (faceLandmarkerPromise) return faceLandmarkerPromise;
+
+  faceLandmarkerPromise = (async () => {
+    const { FaceLandmarker, vision } = await getVisionBundle();
+    return FaceLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: FACE_LANDMARKER_MODEL_URL
+      },
+      runningMode: "VIDEO",
+      numFaces: 1,
+      outputFaceBlendshapes: true
+    });
+  })();
+
+  try {
+    return await faceLandmarkerPromise;
+  } catch (error) {
+    faceLandmarkerPromise = null;
+    throw error;
+  }
+}
+
+async function getPoseLandmarker() {
+  if (poseLandmarkerPromise) return poseLandmarkerPromise;
+
+  poseLandmarkerPromise = (async () => {
+    const { PoseLandmarker, vision } = await getVisionBundle();
+    return PoseLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: POSE_LANDMARKER_MODEL_URL
+      },
+      runningMode: "VIDEO",
+      numPoses: 1
+    });
+  })();
+
+  try {
+    return await poseLandmarkerPromise;
+  } catch (error) {
+    poseLandmarkerPromise = null;
     throw error;
   }
 }
@@ -269,6 +341,227 @@ function featherAlpha(alpha, width, height, radius) {
 function closeSegmentationResult(result) {
   result.categoryMask?.close();
   result.confidenceMasks?.forEach(mask => mask.close());
+}
+
+function setCameraMessage(message, status = "") {
+  const messageBox = $("#cameraMessage");
+  if (!messageBox) return;
+  messageBox.textContent = message;
+  if (status) messageBox.dataset.status = status;
+  else delete messageBox.dataset.status;
+}
+
+function speakCameraAdvice(message, key, force = false) {
+  if (!state.voiceGuidance || !("speechSynthesis" in window)) return;
+
+  const now = Date.now();
+  if (!force && now - state.lastAdviceAt < 4200) return;
+  if (!force && key === state.lastAdviceKey && now - state.lastAdviceAt < 11000) return;
+
+  const utterance = new SpeechSynthesisUtterance(message);
+  utterance.lang = "ja-JP";
+  utterance.rate = 1.02;
+  utterance.pitch = 1;
+  utterance.volume = .9;
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(utterance);
+  state.lastAdviceKey = key;
+  state.lastAdviceAt = now;
+}
+
+function distance2D(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function getLandmarkBox(landmarks) {
+  let minX = 1;
+  let minY = 1;
+  let maxX = 0;
+  let maxY = 0;
+  for (const landmark of landmarks) {
+    minX = Math.min(minX, landmark.x);
+    minY = Math.min(minY, landmark.y);
+    maxX = Math.max(maxX, landmark.x);
+    maxY = Math.max(maxY, landmark.y);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function blendshapeScore(faceResult, names) {
+  const categories = faceResult.faceBlendshapes?.[0]?.categories || [];
+  let score = 0;
+  for (const category of categories) {
+    if (names.includes(category.categoryName)) score = Math.max(score, category.score || 0);
+  }
+  return score;
+}
+
+function getEyeOpenRatio(landmarks) {
+  if (!landmarks[159] || !landmarks[145] || !landmarks[33] || !landmarks[133] ||
+      !landmarks[386] || !landmarks[374] || !landmarks[362] || !landmarks[263]) {
+    return 1;
+  }
+  const left = distance2D(landmarks[159], landmarks[145]) / Math.max(distance2D(landmarks[33], landmarks[133]), .001);
+  const right = distance2D(landmarks[386], landmarks[374]) / Math.max(distance2D(landmarks[362], landmarks[263]), .001);
+  return (left + right) / 2;
+}
+
+function advice(key, message, voice = message, status = "warn") {
+  return { key, message, voice, status };
+}
+
+function analyzeSelfieFrame(video, faceResult, poseResult) {
+  const face = faceResult.faceLandmarks?.[0];
+  if (!face) {
+    return advice(
+      "no-face",
+      "顔が見えていません。スマホを正面に向けてください",
+      "顔が見えていません。スマホを正面に向けてください"
+    );
+  }
+
+  const box = getLandmarkBox(face);
+  const centerX = (box.minX + box.maxX) / 2;
+  const centerY = (box.minY + box.maxY) / 2;
+  const faceHeight = box.maxY - box.minY;
+
+  if (faceHeight < .30) {
+    return advice(
+      "too-far",
+      "顔が少し小さめです。スマホを少し近づけましょう",
+      "顔が少し小さめです。スマホを少し近づけましょう"
+    );
+  }
+  if (faceHeight > .76) {
+    return advice(
+      "too-close",
+      "顔が大きめです。スマホを少し離しましょう",
+      "顔が大きめです。スマホを少し離しましょう"
+    );
+  }
+  if (Math.abs(centerX - .5) > .16 || centerY < .34 || centerY > .58) {
+    return advice(
+      "center-face",
+      "顔を枠の中央に合わせましょう",
+      "顔を枠の中央に合わせましょう"
+    );
+  }
+
+  if (face[33] && face[263] && Math.abs(face[33].y - face[263].y) > .025) {
+    return advice(
+      "face-tilt",
+      "顔が少し傾いています。頭をまっすぐにしましょう",
+      "顔が少し傾いています。頭をまっすぐにしましょう"
+    );
+  }
+
+  const pose = poseResult.landmarks?.[0];
+  const leftShoulder = pose?.[11];
+  const rightShoulder = pose?.[12];
+  if (
+    leftShoulder && rightShoulder &&
+    (leftShoulder.visibility ?? 1) > .45 &&
+    (rightShoulder.visibility ?? 1) > .45 &&
+    Math.abs(leftShoulder.y - rightShoulder.y) > .045
+  ) {
+    return advice(
+      "shoulder-tilt",
+      "肩が少し傾いています。左右の肩の高さをそろえましょう",
+      "肩が少し傾いています。左右の肩の高さをそろえましょう"
+    );
+  }
+
+  const blinkScore = blendshapeScore(faceResult, ["eyeBlinkLeft", "eyeBlinkRight"]);
+  const eyeOpenRatio = getEyeOpenRatio(face);
+  if (blinkScore > .22 || eyeOpenRatio < .15) {
+    return advice(
+      "eyes",
+      "目をもう少しはっきり開いて、レンズを見ましょう",
+      "目をもう少しはっきり開いて、レンズを見ましょう"
+    );
+  }
+
+  const smileScore = blendshapeScore(faceResult, ["mouthSmileLeft", "mouthSmileRight"]);
+  if (smileScore < .10) {
+    return advice(
+      "smile",
+      "口角をほんの少し上げると、やわらかい印象になります",
+      "口角をほんの少し上げると、やわらかい印象になります"
+    );
+  }
+
+  return advice(
+    "good",
+    "いい感じです。そのまま自然な表情で撮れます",
+    "いい感じです。そのまま自然な表情で撮れます",
+    "good"
+  );
+}
+
+function stopCameraGuidance() {
+  state.guidanceActive = false;
+  if (state.guidanceHandle) {
+    clearTimeout(state.guidanceHandle);
+    state.guidanceHandle = null;
+  }
+  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  setCameraMessage("カメラは目の高さに · 背筋を伸ばす · あごを軽く引く");
+}
+
+function scheduleCameraGuidance(delay = 1400) {
+  if (!state.guidanceActive) return;
+  clearTimeout(state.guidanceHandle);
+  state.guidanceHandle = setTimeout(runCameraGuidance, delay);
+}
+
+async function runCameraGuidance() {
+  if (!state.guidanceActive) return;
+
+  const video = $("#cameraVideo");
+  if (!video?.videoWidth) {
+    scheduleCameraGuidance(500);
+    return;
+  }
+
+  try {
+    if (!faceLandmarkerPromise || !poseLandmarkerPromise) {
+      setCameraMessage("AIアドバイスを準備中です…", "loading");
+    }
+    const [faceLandmarker, poseLandmarker] = await Promise.all([
+      getFaceLandmarker(),
+      getPoseLandmarker()
+    ]);
+    if (!state.guidanceActive) return;
+
+    const timestamp = performance.now();
+    const faceResult = faceLandmarker.detectForVideo(video, timestamp);
+    const poseResult = poseLandmarker.detectForVideo(video, timestamp);
+    const nextAdvice = analyzeSelfieFrame(video, faceResult, poseResult);
+    setCameraMessage(nextAdvice.message, nextAdvice.status);
+    speakCameraAdvice(nextAdvice.voice, nextAdvice.key);
+    scheduleCameraGuidance();
+  } catch (error) {
+    setCameraMessage("AIアドバイスを準備できませんでした。画面のガイドを見ながら撮影してください", "warn");
+    if (!state.guidanceErrorShown) {
+      showToast("音声アドバイスを読み込めませんでした。通常の撮影は使えます");
+      state.guidanceErrorShown = true;
+    }
+    scheduleCameraGuidance(4000);
+  }
+}
+
+function startCameraGuidance() {
+  if (state.guidanceActive) return;
+  state.guidanceActive = true;
+  state.guidanceErrorShown = false;
+  state.lastAdviceKey = "";
+  state.lastAdviceAt = 0;
+  state.voiceGuidance = $("#voiceGuidanceToggle")?.checked ?? state.voiceGuidance;
+  setCameraMessage("AIアドバイスを準備中です…", "loading");
+  if (state.voiceGuidance && "speechSynthesis" in window) {
+    speakCameraAdvice("音声アドバイスを始めます", "guidance-start", true);
+  }
+  runCameraGuidance();
 }
 
 async function createPersonMask() {
@@ -897,9 +1190,12 @@ async function openCamera() {
       },
       audio: false
     });
-    $("#cameraVideo").srcObject = state.stream;
-    $("#cameraVideo").style.transform = state.facingMode === "user" ? "scaleX(-1)" : "none";
+    const video = $("#cameraVideo");
+    video.srcObject = state.stream;
+    video.style.transform = state.facingMode === "user" ? "scaleX(-1)" : "none";
+    await video.play().catch(() => {});
     if (!dialog.open) dialog.showModal();
+    startCameraGuidance();
   } catch (error) {
     showToast("カメラを開始できませんでした。写真を選ぶ方法も使えます");
   }
@@ -907,6 +1203,7 @@ async function openCamera() {
 
 function stopCamera() {
   cancelCountdown();
+  stopCameraGuidance();
   if (state.stream) {
     state.stream.getTracks().forEach(track => track.stop());
     state.stream = null;
@@ -955,6 +1252,17 @@ $$(".timer-chip").forEach(button => button.addEventListener("click", () => {
   $$(".timer-chip").forEach(item => item.classList.toggle("active", item === button));
 }));
 
+$("#voiceGuidanceToggle").addEventListener("change", event => {
+  state.voiceGuidance = event.target.checked;
+  if (state.voiceGuidance) {
+    showToast("音声アドバイスをオンにしました");
+    speakCameraAdvice("音声アドバイスをオンにしました", "voice-on", true);
+  } else {
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    showToast("音声アドバイスをオフにしました");
+  }
+});
+
 $("#shutterButton").addEventListener("click", () => {
   // カウントダウン中にもう一度押したらキャンセル
   if (state.countdownHandle) {
@@ -997,6 +1305,14 @@ for (const dialog of $$("dialog")) {
 
 window.addEventListener("beforeunload", stopCamera);
 updateExportText();
+
+const voiceGuidanceToggle = $("#voiceGuidanceToggle");
+if (!("speechSynthesis" in window)) {
+  state.voiceGuidance = false;
+  voiceGuidanceToggle.checked = false;
+  voiceGuidanceToggle.disabled = true;
+  voiceGuidanceToggle.closest(".voice-toggle")?.classList.add("disabled");
+}
 
 if ("serviceWorker" in navigator && location.protocol !== "file:") {
   window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(() => {}));

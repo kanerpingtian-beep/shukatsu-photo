@@ -10,7 +10,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="manifest" href="manifest.webmanifest">
-  <link rel="stylesheet" href="styles.css?v=5">
+  <link rel="stylesheet" href="styles.css?v=6">
 </head>
 <body>
   <header class="site-header">
@@ -272,7 +272,7 @@
         <span class="eye-guide"></span>
       </div>
       <div class="timer-countdown" id="timerCountdown" hidden aria-live="assertive"></div>
-      <div class="camera-message">カメラは目の高さに · 背筋を伸ばす · あごを軽く引く</div>
+      <div class="camera-message" id="cameraMessage">カメラは目の高さに · 背筋を伸ばす · あごを軽く引く</div>
     </div>
     <div class="camera-toolbar">
       <div class="timer-group" role="radiogroup" aria-label="セルフタイマー">
@@ -281,6 +281,11 @@
         <button class="timer-chip" data-timer="3">3秒</button>
         <button class="timer-chip" data-timer="10">10秒</button>
       </div>
+      <label class="voice-toggle">
+        <input id="voiceGuidanceToggle" type="checkbox" checked>
+        <span class="voice-switch" aria-hidden="true"></span>
+        <span>音声アドバイス</span>
+      </label>
     </div>
     <div class="camera-actions">
       <button class="secondary-button" id="switchCameraButton">
@@ -308,6 +313,6 @@
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="app.js?v=5"></script>
+  <script src="app.js?v=6"></script>
 </body>
 </html>
